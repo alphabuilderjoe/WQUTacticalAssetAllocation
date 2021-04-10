@@ -5,26 +5,36 @@ date: "4/9/2021"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+
+```{r load-packages, warning=FALSE}
+#if (!require("pacman")) install.packages("pacman")
+#pacman::p_load(quantmod, PerformanceAnalytics, dplyr, ggplot2, tidyr)
+library(quantmod)
+library(tidyverse)
+library(lubridate)
+
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+```{r get-price-data}
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+tickers <- c('SPY', 'TLT')#, 'GLD', 'VXX', 'VXZ')
+sDate <- ymd("2011-01-01")
+eDate <- ymd("2020-12-31")
 
-```{r cars}
-summary(cars)
+
+#create price download function
+get_symbol <- function(ticker) {
+  #Sys.sleep(10) # To prevent alpha vantage 5 calls per minute limit
+  Ad(getSymbols(ticker, src="av", api.key="6LVGD8WA484YY2YS", output.size="full", auto.assign=FALSE, from = sDate, to = eDate, warning = FALSE, adjusted=TRUE))
+  
+}
+
+raw_prices <- do.call(cbind,lapply(tickers,get_symbol))
+
+
+
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
-```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
