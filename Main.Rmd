@@ -9,17 +9,24 @@ output: html_document
 ```{r load-packages, warning=FALSE}
 #if (!require("pacman")) install.packages("pacman")
 #pacman::p_load(quantmod, PerformanceAnalytics, dplyr, ggplot2, tidyr)
+install.packages("randomForest")
+
+```
+
+```{r}
 library(quantmod)
 library(tidyverse)
-library(lubridate)
+library(PerformanceAnalytics)
+library(randomForest)
+
 
 ```
 
 
 ```{r get-price-data}
 
-tickers <- c('SPY', 'TLT')#, 'GLD', 'VXX', 'VXZ')
-sDate <- ymd("2011-01-01")
+tickers <- c('SPY', 'TLT', 'GLD', 'VXX', 'DBC')
+sDate <- ymd("2009-02-02")
 eDate <- ymd("2020-12-31")
 
 
@@ -31,10 +38,407 @@ get_symbol <- function(ticker) {
 }
 
 raw_prices <- do.call(cbind,lapply(tickers,get_symbol))
+names(raw_prices) <- gsub("\\..+","",names(raw_prices))  #Remove .Adjusted
+tail(raw_prices)
+
+raw_prices <- raw_prices["2009-02-02/2020-12-31"]
+
+write.zoo(raw_prices, file="Data\\raw_prices.csv", sep=",")
+
+```
+
+```{r helper_functions}
+calc_equal_risk_weights <- function(returns, lookback=90) {
+  n_assets <- ncol(returns)
+  vols <- na.omit(apply.rolling(returns[,1], width=lookback, FUN='StdDev.annualized'))
+  for (i in 2:n_assets) {
+    vols <- merge(vols, na.omit(apply.rolling(returns[,i], width=lookback, FUN='StdDev.annualized')))  
+  }
+
+  raw_weights <- 1/vols
+  raw_weights[is.infinite(raw_weights)] <- 0
+  
+  weights <- raw_weights / rowSums(raw_weights) # Normalise weights to add to 1
+  colnames(weights) <- colnames(returns)
+  
+  return(weights)
+}
+
+# Convert xts to df for plotting
+xts_to_tidy_df <- function(x) {
+  df <- cbind(zoo::index(x), as.data.frame(coredata(x)))
+  colnames(df)[1] <- 'Date'
+  gather(df, key='Asset', value='Value', -Date) 
+}
+
+# Calculate marginal contribution to risk (where risk = std of returns)
+# Adapted from FRAPO package
+calc_mrc <- function (weights, Sigma, percentage = TRUE) 
+{
+    Sigma <- as.matrix(Sigma)
+    if (!isSymmetric(Sigma)) {
+        stop("Object provided for 'Sigma' is not a symmetric matrix.\n")
+    }
+    w <- as.vector(weights)
+    if (length(w) != ncol(Sigma)) {
+        stop("Length of 'weights' vector differs from row/column dimension of 'Sigma'.\n")
+    }
+    sigma <- c(sqrt(t(w) %*% Sigma %*% w))
+    sw <- Sigma %*% w
+    dw <- c(w * sw/sigma)
+    ifelse(percentage, res <- dw/sum(dw) * 100, res <- dw)
+    return(res)
+}
+
+# Performance summary function.
+# Returns summary details and prints charts and tables as side effects
+riskperformance <- function(returns, weights, samplefreq = 'days', plot = TRUE, margin_cost = 0) {
+  # ret <- returns_daily[,-5]
+  # weights <- adjweights
+  dailyweights <- xts(matrix(NA, nrow(returns), ncol(returns)), order.by = zoo::index(returns))
+  dailyweights[zoo::index(weights),] <- coredata(weights)
+  dailyweights <- na.omit(na.locf(dailyweights))
+  
+    # Now scale the returns by the asset weights
+  scaleret <- xts::lag.xts(dailyweights,1) * returns
+  colnames(scaleret) <- colnames(returns)
+  
+  # Get trades as percentage of portfolio
+  tradesize <- na.omit(abs(dailyweights - xts::lag.xts(dailyweights)))
+  totaltrade <- rowSums(tradesize)
+  
+  # Get monthly endpoints
+  monthend <- endpoints(scaleret, on = samplefreq)[-1] # remove the first zero from the endpoints vector
+  medt <- zoo::index(scaleret[monthend])
+  
+  # Create xts objects to hold volatilities and risk contributions
+  vol_xts <- xts(matrix(NA, length(medt), ncol(returns)), order.by = zoo::index(scaleret[medt]))
+  mrc_xts <- xts(matrix(NA, length(medt), ncol(returns)), order.by = zoo::index(scaleret[medt]))
+  ts_xts <- xts(matrix(NA, length(medt), ncol(returns)), order.by = zoo::index(scaleret[medt]))
+  colnames(vol_xts) <- colnames(mrc_xts) <- colnames(ts_xts) <- colnames(returns)
+  
+  i <- medt[1]
+  for (n in 2:length(medt)) {
+    j <- medt[n]
+    r <- scaleret[paste0(i,'::',j)] # Get returns over window
+    # Volatility
+    vols <- StdDev.annualized(r) # Estimate volatility of each asset
+    vol_xts[i,] <- vols
+    # MRCD
+    mrc <- calc_mrc(rep(1, ncol(scaleret)), cov(r)) # Estimate risk contribution of each asset (setting weights to zero)
+    mrc_xts[i,] <- mrc
+    # Trades
+    ts <- colSums(tradesize[paste0(i,'::',j)])
+    ts_xts[i,] <- ts
+    i <- j
+  }
+  
+  vol_xts <- na.omit(vol_xts)
+  prop_xts <- vol_xts / rowSums(vol_xts)
+  mrc_xts <- na.omit(mrc_xts)
+  ts_xts <- na.omit(ts_xts)
+  
+  
+  # Realised volatility tracking error
+  trackerror_vol <- mean(rowMeans(abs(prop_xts - 1/ncol(prop_xts)))) * 100
+  
+  # Calculate mean tracking error on MRC
+  trackerror_mrc <- mean(rowMeans(abs(mrc_xts - 100/ncol(mrc_xts))))
+  
+  # Tradesize
+  mean_tradesize <- mean(rowSums(ts_xts))
+  
+  # Performance
+  portfolio_returns <- xts(rowSums(scaleret), order.by=zoo::index(scaleret))
+  # Subtract the cost of leverage if appropriate
+  if (margin_cost != 0) {
+    # Look at cost of leverage
+    port_weights <- xts(rowSums(dailyweights), order.by = zoo::index(dailyweights))
+    margin <- port_weights - 1
+    marginreturn <- margin * (margin_cost / 360) # Estimating margin cost at annualised % / 360
+    portfolio_returns <- portfolio_returns - marginreturn
+  }
+
+  t <- table.AnnualizedReturns(portfolio_returns)
+  cagr <- t[,1][1] * 100
+  sharpe <- t[,1][3]
+  perf <- data.frame(trackerror_vol, trackerror_mrc, mean_tradesize, cagr, sharpe)
+
+  if (plot == TRUE) {
+    # Realised volatility
+    print(plot(vol_xts, main = 'Realised Volatility', legend.loc='topleft'))
+    vol_df <- xts_to_tidy_df(vol_xts)
+    print(ggplot(vol_df, aes(x=Date, y=Value, fill=Asset)) + geom_area() + ggtitle('Realised Volatility'))
+    
+    # Realised volatility %
+    print(plot(prop_xts, main = 'Realised Volatility %', legend.loc='topleft'))
+    prop_df <- xts_to_tidy_df(prop_xts)
+    print(ggplot(prop_df, aes(x=Date, y=Value, fill=Asset)) + geom_area() + ggtitle('Realised Volatility as Proportion of Total'))
+    # Calculate mean tracking error (as %age)
+    trackerror_vol <- mean(rowMeans(abs(prop_xts - 1/ncol(prop_xts)))) * 100
+    
+    #Risk contribution
+    print(plot(mrc_xts, main = 'Risk Contribution', legend.loc='topleft'))
+    mrc_df <- xts_to_tidy_df(mrc_xts)
+    print(ggplot(mrc_df, aes(x=Date, y=Value, fill=Asset)) + geom_area() + ggtitle('Risk Contribution'))
+    # Calculate mean tracking error on MRC
+    trackerror_mrc <- mean(rowMeans(abs(mrc_xts - 100/ncol(mrc_xts))))
+
+    # Tradesize
+    print(plot(ts_xts, main='Trade Size', legend.loc='topleft'))
+    tradesize_df <- xts_to_tidy_df(ts_xts)
+    print(ggplot(tradesize_df, aes(x=Date, y=Value, fill=Asset)) + geom_area() + ggtitle('Rebalance Trades'))
+    mean_tradesize <- mean(rowSums(ts_xts))
+    
+    # Weights
+    print(plot(weights, main='Asset weights', legend.loc='topleft'))
+    weights_df <- xts_to_tidy_df(weights)
+    print(ggplot(weights_df, aes(x=Date, y=Value, fill=Asset)) + geom_area() + ggtitle('Asset Weights'))
+    
+    # Performance
+    print(table.DownsideRisk(portfolio_returns))
+    print(table.Drawdowns(portfolio_returns))
+    charts.PerformanceSummary(portfolio_returns, main = 'Portfolio Returns')
+    print(perf)
+  }
+  return(perf)
+}
 
 
 
 ```
 
 
+```{r Calculate returns}
+
+raw_prices2 <- as.xts(read.zoo("Data\\raw_prices.csv", read=read.csv))
+#raw_prices2$VXZ <- NULL
+raw_prices2 <- na.omit(raw_prices2)
+returns <- na.omit(Return.calculate(raw_prices2, method='discrete')) 
+
+
+#Filter for periods where S&P has fallen more than 5% over past 63 days
+momo <- na.omit(xts::lag.xts(TTR::ROC(raw_prices2$SPY, n=63, type='discrete'),1))
+momo$flag <- 0
+momo$flag[momo$SPY < -0.05] <- 1
+
+returns <- merge(returns, momo$flag, join="left", fill=0)
+returns$VIXstrat <- returns$VXX * returns$flag
+returns$VXX <- NULL
+returns$flag <- NULL
+
+
+#Commodity strategy - long DBC when its above 50-SMA, and short DBC when its below
+raw_prices2$DBC_50MA <- na.omit(apply.rolling(raw_prices2$DBC, width=50, FUN="mean"))
+raw_prices2$DBCflag <- 0
+raw_prices2$DBCflag[raw_prices2$DBC < raw_prices2$DBC_50MA] <- -1
+raw_prices2$DBCflag[raw_prices2$DBC > raw_prices2$DBC_50MA] <- 1
+raw_prices2$DBCflag_lag <- stats::lag(raw_prices2$DBCflag, k=1) #prevent lookahead bias
+
+returns <- merge(returns, raw_prices2$DBCflag_lag, join="left", fill=0)
+returns$DBCstrat <- returns$DBC * returns$DBCflag_lag
+returns$DBC <- NULL
+returns$DBCflag_lag <- NULL
+
+plot(cumprod(1+returns))
+```
+
+
+```{r EDA}
+
+
+
+
+```
+
+
+
+```{r Equal weight portfolios}
+
+```
+
+
+```{r Equal risk portfolio}
+
+weights <- calc_equal_risk_weights(returns)
+
+
+```
+
+```{r}
+
+riskperformance(returns, weights)
+
+
+```
+
+
+
+
+Use random forest to classify whether either asset class will return +ve or -ve, based on the various features?
+
+Then group together 
+
+Features
+Interest rates and yield curve changes
+https://www.quandl.com/data/FED/RIFLGFCY02_N_B-Market-yield-on-U-S-Treasury-securities-at-2-year-constant-maturity-quoted-on-investment-basis-Business-day
+https://www.quandl.com/data/FED/RIFLGFCY05_N_B-Market-yield-on-U-S-Treasury-securities-at-5-year-constant-maturity-quoted-on-investment-basis-Business-day
+https://www.quandl.com/data/FED/RIFLGFCY10_N_B-Market-yield-on-U-S-Treasury-securities-at-10-year-constant-maturity-quoted-on-investment-basis-Business-day
+
+Fed Fund Futures   https://www.macrotrends.net/2015/fed-funds-rate-historical-chart
+Changes in implied volatility term structure
+https://fred.stlouisfed.org/series/VIXCLS
+https://fred.stlouisfed.org/series/VXVCLS
+Momentum factors - 3,6 12 month momentum
+
+value factors - CAPE
+https://www.quandl.com/data/MULTPL/SHILLER_PE_RATIO_MONTH-Shiller-PE-Ratio-by-Month
+
+
+
+```{r Gather features}
+features <- as.xts(read.zoo("Data\\US2year.csv", read=read.csv))
+features <- merge(features, as.xts(read.zoo("Data\\US5year.csv", read=read.csv)), join="left", fill=na.locf)
+features <- merge(features, as.xts(read.zoo("Data\\US10year.csv", read=read.csv)), join="left", fill=na.locf)
+features <- merge(features, as.xts(read.zoo("Data\\fed-funds-rate-historical-chart.csv", read=read.csv)), join="left", fill=na.locf)
+features <- merge(features, as.xts(read.zoo("Data\\VIX1M.csv", read=read.csv)), join="left", fill=na.locf)
+features <- merge(features, as.xts(read.zoo("Data\\VIX3M.csv", read=read.csv)), join="left", fill=na.locf)
+features <- merge(features, as.xts(read.zoo("Data\\MULTPL-SHILLER_PE_RATIO_MONTH.csv", read=read.csv)), join="left", fill=na.locf)
+
+colnames(features) <- c("US2year", "US5year", "US10year", "FedFunds", "VIX1M", "VIX3M", "CAPE" )
+
+features <- features["2009-02-02/"]
+
+features$US2_5 <- features$US5year - features$US2year
+features$US5_10 <- features$US10year - features$US5year
+features$IVTS <- features$VIX1M / features$VIX3M
+
+
+momo_adjust <- function(features, col_name, width = 5) {
+  temp <- ( features[,col_name] - stats::lag(features[,col_name],width))
+  colnames(temp) <- paste(col_name,"_",width,"momo", sep="")
+  features <- merge(features,temp)
+  return(features)
+}
+
+vol_adjust <- function(features, col_name, width = 5) {
+  temp <- ( features[,col_name] - stats::lag(features[,col_name],width))/ rollapply(features[,col_name], width=width, FUN = sd)
+  colnames(temp) <- paste(col_name,"_",width,"va", sep="")
+  features <- merge(features,temp)
+  return(features)
+}
+
+
+
+features <- momo_adjust(features, "US2year", width=5)
+features <- momo_adjust(features, "US5year", width=5)
+features <- momo_adjust(features, "US10year", width=5)
+features <- momo_adjust(features, "FedFunds", width=5)
+features <- vol_adjust(features, "VIX1M", width=5)
+features <- vol_adjust(features, "VIX3M", width=5)
+features <- momo_adjust(features, "US2_5", width=5)
+features <- momo_adjust(features, "US5_10", width=5)
+features <- vol_adjust(features, "IVTS", width=5)
+
+
+
+combined <- na.omit(merge(features, returns))
+
+prev_1_returns <- stats::lag(returns, k=1)
+prev_2_returns <- stats::lag(returns, k=1)
+prev_3_returns <- stats::lag(returns, k=1)
+future_returns <- sign(stats::lag(returns, k=-1))
+
+colnames(prev_1_returns) <- paste(colnames(returns),"_prev_1",sep="")
+colnames(prev_2_returns) <- paste(colnames(returns),"_prev_2",sep="")
+colnames(prev_3_returns) <- paste(colnames(returns),"_prev_3",sep="")
+colnames(future_returns) <- paste(colnames(returns),"_future",sep="")
+
+combined <- na.omit(merge(combined, prev_1_returns))
+combined <- na.omit(merge(combined, prev_2_returns))
+combined <- na.omit(merge(combined, prev_3_returns))
+combined <- na.omit(merge(combined, future_returns))
+
+```
+
+
+```{r run random forest}
+run_random_forest <- function(combined_xts, symbol="SPY_future", all_tickers=colnames(future_returns)){
+  ticker_to_remove <- all_tickers[all_tickers != symbol]
+  combined_data_frame <- as.data.frame(combined[ , -which(names(combined) %in% ticker_to_remove)])
+  combined_data_frame[,symbol] <- as.character(combined_data_frame[,symbol])
+  combined_data_frame[,symbol] <- as.factor(combined_data_frame[,symbol])
+  
+  TrainSet <- combined_data_frame[0:(0.7*nrow(combined_data_frame)),]
+
+
+  
+  forest <- randomForest(as.formula(paste(symbol," ~ .", sep="")), data=TrainSet, importance=TRUE)
+  return(forest)
+}
+
+forest <- run_random_forest(combined, symbol="SPY_future")
+```
+
+```{r}
+forest <- run_random_forest(combined, symbol="DBCstrat_future")
+
+predValid <- predict(forest, ValidSet, type="class")
+mean(predValid == ValidSet$SPY_future)
+table(predValid, ValidSet$SPY_future)
+#importance(forest)
+varImpPlot(forest, n.var=15)
+
+```
+
+
+```{r Rolling random forest}
+train_random_forest <- function(combined_xts, symbol="SPY_future", end_train_date="2015-01-01", all_tickers=colnames(future_returns)){
+  ticker_to_remove <- all_tickers[all_tickers != symbol]
+  combined_xts <- combined_xts[paste("/",end_train_date,sep="")]
+  
+  combined_data_frame <- as.data.frame(combined_xts[ , -which(names(combined_xts) %in% ticker_to_remove)])
+  combined_data_frame[,symbol] <- as.character(combined_data_frame[,symbol])
+  combined_data_frame[,symbol] <- as.factor(combined_data_frame[,symbol])
+  
+  TrainSet <- combined_data_frame
+
+  
+  forest <- randomForest(as.formula(paste(symbol," ~ .", sep="")), data=TrainSet, importance=TRUE)
+  return(forest)
+}
+
+rolling_random_forest <- function(combined_xts, symbol="SPY", start_valid_date="2015-01-01", end_valid_date="2015-01-31") {
+  ticker_to_remove <- all_tickers[all_tickers != paste(symbol,"_future", sep="")]
+  
+  #Create column to store output signal from random forests
+  combined_xts <- do.call(cbind,setNames(c(list(combined_xts),rep(list(0),length(paste(symbol,"_signal",sep="")))),c("",paste(symbol,"_signal",sep="")))) 
+  
+  valid_dates <- index(combined_xts[paste(start_valid_date,"/",end_valid_date, sep="")])
+  
+  for (date in valid_dates){
+  
+    train_xts <- combined_xts[paste("/",as.Date(date)-1,sep="")]
+    valid_stx <- combined_xts[date]
+    
+    forest <- train_random_forest(train_xts, symbol=paste(symbol,"_future", sep=""), end_train_date=as.Date(date)-1)
+    
+    predValid <- predict(forest, valid_stx, type="class")
+    
+    combined_xts[date,paste(symbol,"_signal",sep="")] <- as.numeric(levels(predValid))[predValid]
+    
+  }
+}
+
+
+
+```
+
+
+
+
+
+
+#References
+https://www.r-bloggers.com/2018/01/how-to-implement-random-forests-in-r/
 
