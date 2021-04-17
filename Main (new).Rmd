@@ -271,6 +271,10 @@ https://www.quandl.com/data/MULTPL/SHILLER_PE_RATIO_MONTH-Shiller-PE-Ratio-by-Mo
 
 
 ```{r Gather features}
+
+
+
+
 features <- as.xts(read.zoo("Data\\US2year.csv", read=read.csv))
 features <- merge(features, as.xts(read.zoo("Data\\US5year.csv", read=read.csv)), join="left", fill=na.locf)
 features <- merge(features, as.xts(read.zoo("Data\\US10year.csv", read=read.csv)), join="left", fill=na.locf)
@@ -474,4 +478,9 @@ riskperformance(strat_returns["2015-01-01/2020-12-31"], raw_weights["2015-01-01/
 
 #References
 https://www.r-bloggers.com/2018/01/how-to-implement-random-forests-in-r/
+
+(better to predict results 10+ days ahead)
+https://rstudio-pubs-static.s3.amazonaws.com/412512_27650b0b41af4aa2933e3a8b4e48480e.html  
+
+
 
